@@ -1,0 +1,142 @@
+name: Deploy quotes-api
+
+# Lab02 (Blok 2): lint -> test -> build (ECR) -> deploy (EKS, app/k8s-dzien1/, bez Argo
+# Rollouts — Rollout wchodzi dopiero w dniu 2). Uwierzytelnianie do AWS przez OIDC,
+# bez długoterminowych kluczy (.claude/CLAUDE.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Domyślnie GITHUB_TOKEN nie ma żadnych uprawnień — każdy job dopisuje sobie tylko to,
+# czego naprawdę potrzebuje (patrz uzasadnienia przy jobach niżej).
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Tylko odczyt repo pod checkout — lint niczego nie publikuje i nie rozmawia z AWS.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r app/requirements-dev.txt
+      - run: ruff check app/
+
+  test:
+    name: Testy (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Jak lint — tylko odczyt repo, testy działają lokalnie na runnerze.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r app/requirements-dev.txt
+      - working-directory: app
+        run: pytest -q
+
+  build:
+    name: Build i push obrazu do ECR
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # contents: read pod checkout. id-token: write jest potrzebne WYŁĄCZNIE w tym jobie
+    # i w jobie deploy — to on rozmawia z AWS i musi umieć wymienić token OIDC na
+    # tymczasowe poświadczenia roli AWS_DEPLOY_ROLE_ARN. Bez tego pola cały workflow
+    # musiałby trzymać długoterminowy klucz AWS w sekretach — właśnie tego unikamy.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uwierzytelnienie do AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: Login do ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build i push obrazu
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: quotes-api
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg APP_VERSION="${TAG}" \
+            -t "${REGISTRY}/${REPOSITORY}:${TAG}" \
+            app/
+          docker push "${REGISTRY}/${REPOSITORY}:${TAG}"
+          echo "image=${REGISTRY}/${REPOSITORY}:${TAG}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy na EKS
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Ten sam powód co w build: id-token: write do wymiany tokenu OIDC na poświadczenia
+    # roli, która ma prawa do EKS. contents: read tylko po to, żeby zaczytać manifesty
+    # z app/k8s-dzien1/ — job nie modyfikuje repozytorium.
+    #
+    # Celowo BEZ klucza `environment:` — zmienia on tożsamość (sub) w tokenie OIDC,
+    # a rola github-actions-deploy zaufała konkretnemu repo/gałęzi, nie środowisku.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uwierzytelnienie do AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: kubeconfig dla klastra szkoleniowego
+        run: aws eks update-kubeconfig --name szkolenie-ai-devops --region eu-central-1
+
+      - name: Podmień obraz w manifeście
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          sed -i "s#PODMIEN_NA_OBRAZ#${IMAGE}#" app/k8s-dzien1/deployment.yaml
+
+      - name: Zastosuj manifesty (Deployment, Service)
+        env:
+          NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          kubectl apply -n "${NAMESPACE}" -f app/k8s-dzien1/deployment.yaml
+          kubectl apply -n "${NAMESPACE}" -f app/k8s-dzien1/service.yaml
+
+      - name: Czekaj, aż Deployment będzie gotowy
+        env:
+          NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          kubectl rollout status deployment/quotes-api-d1 -n "${NAMESPACE}" --timeout=180s
