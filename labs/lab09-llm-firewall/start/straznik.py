@@ -25,6 +25,13 @@ WZORCE = [
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "klucz prywatny"),
     (r"(?i)(postgres(ql)?|mysql|mongodb)://[^\s:]+:[^\s@]+@", "connection string z hasłem"),
     (r"(?i)\b(hasło|password|passwd)\s*[=:]\s*\S{6,}", "hasło w treści"),
+    # ARN ma stały, jednoznaczny format (arn:aws:<usługa>:<region>:<konto>:<zasób>) —
+    # samo "arn:aws:" wystarcza za kontekst, nie trzeba nic dodatkowo zawężać.
+    (r"arn:aws:[a-z0-9][a-z0-9-]*:[a-z0-9-]*:\d{12}:\S+", "ARN AWS"),
+    # Goły 12-cyfrowy identyfikator konta AWS bez ARN-u wymaga kontekstu ("konto"/"account")
+    # w pobliżu — inaczej łapie numery telefonów, faktur i połowę ID w innych systemach.
+    (r"(?i)\b(konto|account)(\s+aws)?\s*(nr\.?|numer|number|id|#)?\s*[:=]?\s*\d{12}\b",
+     "identyfikator konta AWS"),
 ]
 
 
