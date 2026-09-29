@@ -1,0 +1,43 @@
+# Dostrojona wersja z Etapu 2 (start/hpa.yaml ma próg 90% i max 3 — celowo źle).
+#
+# Zmierzone (generator ruchu puszczony Z WEWNĄTRZ KLASTRA, nie z maszyny uczestnika —
+# przez ALB z zewnątrz ruch szedł przez ograniczoną łączem sieciowym ścieżkę do AWS
+# i dawał fałszywie złe wyniki niezależne od liczby replik czy limitu CPU):
+#
+#   start/hpa.yaml (90% / max 3):      p95 ≈ 1,03 s (ustabilizowane na 3 replikach)
+#   ten plik (50% / min 2 / max 8):    p95 ≈ 0,91 s, skalowanie do 8 replik w ~40 s
+#
+# Dlaczego te wartości:
+# - averageUtilization: 50 zamiast 90 — HPA reaguje, zanim aplikacja jest realnie
+#   przeciążona, nie dopiero przy niemal pełnym wykorzystaniu requests.cpu.
+# - maxReplicas: 8 zamiast 3 — 3 to twardy sufit, który dławi ruch niezależnie od tego,
+#   jak szybko HPA zareaguje. Bezpieczne w namespace'owym ResourceQuota (pods: 20,
+#   requests.cpu: 2 — przy requests.cpu=100m/pod starcza z zapasem).
+# - minReplicas: 2 — tyle samo co w HPA z lab07, zapas na start bez czekania na skalowanie.
+# - scaleUp.stabilizationWindowSeconds: 0 — nie ma powodu czekać z reakcją w górę.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: quotes-api
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: quotes-api
+
+  minReplicas: 2
+  maxReplicas: 8
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      stabilizationWindowSeconds: 300
